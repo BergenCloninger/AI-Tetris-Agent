@@ -12,25 +12,25 @@ from skimage.measure import label, regionprops
 np.set_printoptions(threshold=np.inf)
 
 gym.register_envs(ale_py)
-env = gym.make('ALE/Tetris-v5', render_mode=None)
+env = gym.make('ALE/Tetris-v5', render_mode=None)  # Disable rendering during training
 
 obs, info = env.reset()
 
-def process_image_to_grid(image):
+def process_image_to_grid(image):  # Process game board into 22x10 binary grid
     x_start, y_start = 22, 27
     grid_width, grid_height = 42, 175
 
     cropped_image = image[y_start:y_start + grid_height, x_start:x_start + grid_width]
 
-    intensity = np.sum(cropped_image, axis=-1)
+    intensity = np.sum(cropped_image, axis=-1)  # Sum of RGB
 
-    threshold = 350
+    threshold = 350  # Grey color of background has an intensity of 333
     binary_image = (intensity > threshold).astype(int)
 
     labeled_image = label(binary_image)
     regions = regionprops(labeled_image)
 
-    new_grid_height, new_grid_width = 22, 10
+    new_grid_height, new_grid_width = 22, 10  # Size of the Tetris grid
     resized_grid = np.zeros((new_grid_height, new_grid_width), dtype=int)
 
     grid_height, grid_width = binary_image.shape
@@ -73,7 +73,7 @@ input_dim = 22 * 10
 output_dim = env.action_space.n
 model = QNetwork(input_dim, output_dim)
 target_model = QNetwork(input_dim, output_dim)
-target_model.load_state_dict(model.state_dict())
+target_model.load_state_dict(model.state_dict())  # Initialize target model with the same weights
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 criterion = nn.MSELoss()
 
@@ -88,13 +88,13 @@ memory = deque(maxlen=100000)
 frames_since_last_spawned_piece = 0
 
 def select_action(state):
-    if np.random.rand() < epsilon:
+    if np.random.rand() < epsilon:  # Random action if generated number is < epsilon, otherwise best action
         return np.random.choice(output_dim)
     else:
         with torch.no_grad():
             state_tensor = torch.tensor(state).float().unsqueeze(0)
             q_values = model(state_tensor)
-            return torch.argmax(q_values).item()
+            return torch.argmax(q_values).item()  # Best action
 
 previous_game_grid = None
 static_game_grid = None
@@ -148,35 +148,68 @@ def compute_grid_features(game_grid):
         if 1 in game_grid[row]:
             y_pos = row
             break
-    return total_heights, bumpiness, holes, (22-y_pos)
+    return total_heights, bumpiness, holes, y_pos
 
 def calculate_rewards(game_grid, survived_steps, total_lines_cleared, terminated):
     global previous_game_grid
     global static_game_grid
     check_grid(game_grid)
-    
     if (frames_since_last_spawned_piece == 0):
         static_game_grid = previous_game_grid
-
     total_heights, bumpiness, holes, y_pos = compute_grid_features(static_game_grid)
 
     calc_reward = 0
 
-    survival_reward = 0.02 * survived_steps
+    # Board is half full or bumpiness is high
+    board_half_full = total_heights >= 110 or (total_heights >= 90 and bumpiness >= 10)
+
+    if total_heights >= 140 or (total_heights >= 110 and bumpiness >= 12):
+        hole_penalty = -2.743561101942274
+    elif total_heights >= 90 or (total_heights >= 70 and bumpiness >= 9):
+        hole_penalty = -4.743561101942274
+    else:
+        hole_penalty = -1
+
+    pillar_penalty = 0
+    if holes > 0 or board_half_full:
+        pillar_penalty = -1
+
+    high_placement_penalty = 0
+    if total_heights <= 40:
+        high_placement_penalty = (10 - y_pos) * 2
+    elif total_heights <= 100: 
+        high_placement_penalty = (10 - y_pos)
+
+    if y_pos >= 12:
+        calc_reward -= high_placement_penalty
+
+    if terminated:
+        calc_reward -= 10
+
+    survival_reward = 0.01 * survived_steps
     calc_reward += survival_reward
 
-    height_penalty = y_pos
+    if y_pos >= 9:
+        calc_reward += 5
+    else:
+        calc_reward -= (10 - y_pos) * 0.2
+
+    height_penalty = 0.05 * total_heights
     calc_reward -= height_penalty
 
-    line_clear_reward = total_lines_cleared * 200
+    line_clear_reward = (2 ** total_lines_cleared) * 10
     calc_reward += line_clear_reward
 
-    hole_penalty = 1
+    if total_lines_cleared == 4:
+        calc_reward += 5000
+
     hole_penalty_total = hole_penalty * holes
-    calc_reward -= hole_penalty_total
+    calc_reward += hole_penalty_total
 
     bumpiness_penalty = 0.1 * bumpiness
     calc_reward -= bumpiness_penalty
+
+    calc_reward += pillar_penalty
 
     return calc_reward
 
@@ -190,8 +223,6 @@ for epoch in range(n_epochs):
     static_game_grid = game_grid
 
     while not done:
-        print(static_game_grid)
-        print(game_grid)
         previous_game_grid = game_grid
 
         game_grid = process_image_to_grid(state)
@@ -210,8 +241,10 @@ for epoch in range(n_epochs):
         game_grid_next = process_image_to_grid(next_state)
         next_state_flat = game_grid_next.flatten()
 
+        # Add to memory
         memory.append((state_flat, action, reward, next_state_flat, terminated or truncated))
 
+        # Ensure we have enough samples in memory before starting training
         if len(memory) > batch_size:
             batch = random.sample(memory, batch_size)
             for s, a, r, next_s, done in batch:
@@ -236,6 +269,8 @@ for epoch in range(n_epochs):
 
         done = terminated or truncated
 
+
+
     if epsilon > min_epsilon:
         epsilon *= epsilon_decay
 
@@ -243,10 +278,10 @@ for epoch in range(n_epochs):
         print(f"Epoch {epoch + 1}/{n_epochs} | Total Reward: {total_reward} | Epsilon: {epsilon}")
 
     if epoch % 10 == 0:
-        target_model.load_state_dict(model.state_dict())
+        target_model.load_state_dict(model.state_dict())  # Update target model
 
-n_test_runs = 20 
-env = gym.make('ALE/Tetris-v5', render_mode='human')
+n_test_runs = 20  # Display agent n times after training
+env = gym.make('ALE/Tetris-v5', render_mode='human')  # Enable rendering to test
 
 for run in range(n_test_runs):
     state, info = env.reset()
