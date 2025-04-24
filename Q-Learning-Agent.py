@@ -16,6 +16,47 @@ env = gym.make('ALE/Tetris-v5', render_mode=None)
 
 obs, info = env.reset()
 
+tetromino_shapes = {
+    0: np.array([[1, 1, 1, 1]]),                      # I
+    1: np.array([[1, 1], [1, 1]]),                    # O
+    2: np.array([[0, 1, 0], [1, 1, 1]]),              # T
+    3: np.array([[1, 0], [1, 0], [1, 1]]),            # L
+    4: np.array([[0, 1], [0, 1], [1, 1]]),            # J
+    5: np.array([[0, 1, 1], [1, 1, 0]]),              # S
+    6: np.array([[1, 1, 0], [0, 1, 1]])               # Z
+}
+
+def match_tetromino(shape):
+    shape = np.array(shape)
+
+    if shape.shape == (2, 2) and np.all(shape == 1):
+        return 1
+
+    for tid, template in tetromino_shapes.items():
+        for k in range(4):
+            rotated = np.rot90(template, k)
+            if shape.shape == rotated.shape and np.all(shape == rotated):
+                return tid
+    return -1
+
+def identify_falling_piece(prev_grid, curr_grid, static_grid):
+    if prev_grid is None or static_grid is None:
+        return -1
+
+    falling_piece_mask = (curr_grid == 1) & (static_grid == 0)
+    top_rows = 4
+    top_falling = falling_piece_mask[:top_rows]
+
+    labeled = label(top_falling)
+    props = regionprops(labeled)
+
+    if not props:
+        return -1
+
+    region = max(props, key=lambda r: r.area)
+    shape = region.image
+    return match_tetromino(shape)
+
 def process_image_to_grid(image):
     x_start, y_start = 22, 27
     grid_width, grid_height = 42, 175
@@ -58,18 +99,20 @@ def process_image_to_grid(image):
 class QNetwork(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(QNetwork, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.fc4 = nn.Linear(64, output_dim)
+        self.fc1 = nn.Linear(input_dim, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 128)
+        self.fc4 = nn.Linear(128, 64)
+        self.fc5 = nn.Linear(64, output_dim)
 
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
         x = torch.relu(self.fc3(x))
-        return self.fc4(x)
+        x = torch.relu(self.fc4(x))
+        return self.fc5(x)
 
-input_dim = 22 * 10
+input_dim = 22 * 10 + 1 + 1
 output_dim = env.action_space.n
 model = QNetwork(input_dim, output_dim)
 target_model = QNetwork(input_dim, output_dim)
@@ -77,15 +120,15 @@ target_model.load_state_dict(model.state_dict())
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 criterion = nn.MSELoss()
 
-# Hyperparameters
 gamma = 0.99
 epsilon = 1.0
-epsilon_decay = 0.995
+epsilon_decay = 0.999
 min_epsilon = 0.1
-n_epochs = 300
+n_epochs = 1000
 batch_size = 64
-memory = deque(maxlen=100000)
+memory = deque(maxlen=10000)
 frames_since_last_spawned_piece = 0
+current_falling_piece_label = 1
 
 def select_action(state):
     if np.random.rand() < epsilon:
@@ -100,13 +143,14 @@ previous_game_grid = None
 static_game_grid = None
 
 def check_grid(game_grid):
-    global frames_since_last_spawned_piece
+    global frames_since_last_spawned_piece, current_falling_piece_label
     found_piece = False
 
     for col in range(game_grid.shape[1]):
         for row in range(game_grid.shape[0]):
             if game_grid[row, col] == 1:
-                if (game_grid.shape[0] - row > 19 and frames_since_last_spawned_piece > 10): #scuffed, but required for it to work properly
+                if (game_grid.shape[0] - row > 20 and frames_since_last_spawned_piece > 10):
+                    current_falling_piece_label = identify_falling_piece(previous_game_grid, game_grid, static_game_grid) # 0 = I, 1 = O, 2 = T, 3 = L, 4 = J, 5 = S, 6 = Z
                     frames_since_last_spawned_piece = 0
                 if (game_grid.shape[0] - row == 22 and frames_since_last_spawned_piece == 0):
                     found_piece = True
@@ -129,7 +173,7 @@ def compute_grid_features(game_grid):
                 column_heights.append(game_grid.shape[0] - row)
                 break
         else:
-            column_heights.append(0) 
+            column_heights.append(0)
 
     total_heights = sum(column_heights)
 
@@ -148,37 +192,67 @@ def compute_grid_features(game_grid):
         if 1 in game_grid[row]:
             y_pos = row
             break
-    return total_heights, bumpiness, holes, (22-y_pos)
 
-def calculate_rewards(game_grid, survived_steps, total_lines_cleared, terminated):
-    global previous_game_grid
-    global static_game_grid
+    return total_heights, bumpiness, holes, (22 - y_pos), column_heights
+
+def calculate_rewards(game_grid, survived_steps, temp_lines_cleared, terminated):
+    global previous_game_grid, static_game_grid, frames_since_last_spawned_piece, lines_cleared
+
+    if temp_lines_cleared > 0:
+        lines_cleared = temp_lines_cleared
+
     check_grid(game_grid)
-    
-    if (frames_since_last_spawned_piece == 0):
+
+    if frames_since_last_spawned_piece == 0:
         static_game_grid = previous_game_grid
 
-    total_heights, bumpiness, holes, y_pos = compute_grid_features(static_game_grid)
+    if np.count_nonzero(static_game_grid) == 0:
+        return 0
 
-    calc_reward = 0
+    total_heights, bumpiness, holes, y_pos, column_heights = compute_grid_features(static_game_grid)
 
-    survival_reward = 0.02 * survived_steps
-    calc_reward += survival_reward
+    active_columns = sum(1 for h in column_heights if h > 0)
+    hole_density = holes / active_columns if active_columns else 0
 
-    height_penalty = y_pos
-    calc_reward -= height_penalty
+    max_height = max(column_heights)
+    min_height = min(h for h in column_heights if h > 0) if active_columns else 0
 
-    line_clear_reward = total_lines_cleared * 200
-    calc_reward += line_clear_reward
+    weights = {
+        'hole_penalty': -5.0,
+        'line_clear_base': 100,
+        'tetris_bonus': 5000,
+        'low_stack_bonus': 3.0,
+        'clean_stack_bonus': 10.0,
+        'flatness_penalty': -0.1,
+        'game_over': 1000
+    }
 
-    hole_penalty = 1
-    hole_penalty_total = hole_penalty * holes
-    calc_reward -= hole_penalty_total
+    reward = 0
 
-    bumpiness_penalty = 0.1 * bumpiness
-    calc_reward -= bumpiness_penalty
+    reward += weights['hole_penalty'] * holes
 
-    return calc_reward
+    if max_height <= 12 and holes == 0:
+        reward += weights['clean_stack_bonus']
+        reward += weights['low_stack_bonus'] * (1 - (max_height / 12)) 
+
+    if max_height > 0:
+        flatness = sum(abs(column_heights[i] - column_heights[i - 1]) for i in range(1, len(column_heights)))
+        reward += weights['flatness_penalty'] * flatness
+
+    if terminated:
+        reward -= weights['game_over']
+
+    if lines_cleared > 0:
+        reward += (2 ** lines_cleared) * weights['line_clear_base']
+        if lines_cleared == 4:
+            reward += weights['tetris_bonus']
+
+    if frames_since_last_spawned_piece == 0:
+        previous_game_grid = np.copy(static_game_grid)
+        lines_cleared = 0
+        return reward
+
+    return 0
 
 for epoch in range(n_epochs):
     state, info = env.reset()
@@ -187,28 +261,30 @@ for epoch in range(n_epochs):
     survived_steps = 0
     game_grid = process_image_to_grid(state)
     previous_game_grid = game_grid
-    static_game_grid = game_grid
+    static_game_grid = np.zeros((22, 10), dtype=int)
+    lines_cleared = 0
+    current_falling_piece_label = 1
 
     while not done:
-        print(static_game_grid)
-        print(game_grid)
         previous_game_grid = game_grid
 
         game_grid = process_image_to_grid(state)
-        state_flat = game_grid.flatten()
+        state_flat = np.concatenate([game_grid.flatten(), [lines_cleared], [current_falling_piece_label]])
 
         action = select_action(state_flat)
 
-        next_state, total_lines_cleared, terminated, truncated, info = env.step(action)
+        next_state, temp_lines_cleared, terminated, truncated, info = env.step(action)
+        frames_since_last_spawned_piece += 1
 
         survived_steps += 1
 
-        reward = calculate_rewards(game_grid, survived_steps, total_lines_cleared, terminated=False)
-
+        reward = calculate_rewards(game_grid, survived_steps, temp_lines_cleared, terminated)
         total_reward += reward
 
+        lines_cleared = temp_lines_cleared
+
         game_grid_next = process_image_to_grid(next_state)
-        next_state_flat = game_grid_next.flatten()
+        next_state_flat = np.concatenate([game_grid_next.flatten(), [lines_cleared], [current_falling_piece_label]])
 
         memory.append((state_flat, action, reward, next_state_flat, terminated or truncated))
 
@@ -232,7 +308,7 @@ for epoch in range(n_epochs):
                 optimizer.step()
 
         state = next_state
-        frames_since_last_spawned_piece = frames_since_last_spawned_piece + 1
+        frames_since_last_spawned_piece += 1
 
         done = terminated or truncated
 
@@ -245,7 +321,7 @@ for epoch in range(n_epochs):
     if epoch % 10 == 0:
         target_model.load_state_dict(model.state_dict())
 
-n_test_runs = 20 
+n_test_runs = 20
 env = gym.make('ALE/Tetris-v5', render_mode='human')
 
 for run in range(n_test_runs):
@@ -259,7 +335,7 @@ for run in range(n_test_runs):
     
     while not done:
         game_grid = process_image_to_grid(state)
-        state_flat = game_grid.flatten()
+        state_flat = np.concatenate([game_grid.flatten(), [lines_cleared], [current_falling_piece_label]])
 
         action = select_action(state_flat)
 
